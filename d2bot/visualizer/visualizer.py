@@ -23,8 +23,8 @@ class Visualizer:
             self.master.after(1, self.loop)
 
     def visualize(self):
+        self.canvas.delete("all")
         self.gen = self.env.run(True)
         self.gen.send(None)
-        self.canvas.delete("all")
         self.master.after(1,self.loop)
         self.master.mainloop()
