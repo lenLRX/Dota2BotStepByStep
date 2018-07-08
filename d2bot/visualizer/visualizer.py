@@ -6,11 +6,11 @@ windows_size = 600
 
 class Visualizer:
 
-    def __init__(self):
+    def __init__(self, clazz=core.GameEnv):
         self.master = Tk()
         self.canvas = Canvas(self.master, width=windows_size, height=windows_size)
         self.canvas.pack()
-        self.env = core.GameEnv(self.canvas)
+        self.env = clazz(self.canvas)
         self.running = True
         self.env.cleanup_fn = lambda _: self.stop()
     
