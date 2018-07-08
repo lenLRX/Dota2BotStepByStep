@@ -52,19 +52,19 @@ class GameEnv:
         self.cleanup_fn()
 
     def _default_init_fn(self, arg=None):
-        print('_default_init_fn')
+        #print('_default_init_fn')
         return None
 
     def _default_stop_cond_fn(self, arg=None):
-        print('_default_stop_cond_fn')
+        #print('_default_stop_cond_fn')
         return False
 
     def _default_cleanup_fn(self, arg=None):
-        print('_default_cleanup_fn')
+        #print('_default_cleanup_fn')
         return None
 
     def _default_step_fn(self, arg=None):
-        print('_default_step_fn')
+        #print('_default_step_fn')
         return None
 
 def test_fn():
