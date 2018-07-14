@@ -14,17 +14,24 @@ class Visualizer:
         self.running = True
         self.env.cleanup_fn = lambda _: self.stop()
     
+    def start_game(self):
+        self.gen = self.env.run(True)
+        self.gen.send(None)
+
+    
     def stop(self):
         self.running = False
 
     def loop(self):
-        self.gen.send((None,))
+        try:
+            self.gen.send((None,))
+        except StopIteration:
+            self.start_game()
         if self.running:
             self.master.after(1, self.loop)
 
     def visualize(self):
         self.canvas.delete("all")
-        self.gen = self.env.run(True)
-        self.gen.send(None)
+        self.start_game()
         self.master.after(1,self.loop)
         self.master.mainloop()
