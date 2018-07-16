@@ -6,7 +6,7 @@ class DefaultGameEnv(game_env.GameEnv):
     def _generator_run(self, input_):
         self.init_fn(input_)
 
-        self.engine = simulator.Simulator(canvas=self.canvas)
+        self.engine = simulator.Simulator(feature_name='unit_test1', actionspace_name='lattice1', canvas=self.canvas)
 
         while True:
             dire_predefine_step = self.engine.predefined_step("Dire",0)
