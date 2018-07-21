@@ -14,8 +14,10 @@ class LSTM_Module(nn.Module):
 
     def __init__(self):
         super(LSTM_Module,self).__init__()
-        self.hidden_num = 9
-        self.lstm = nn.LSTM(5, self.hidden_num)#idle move atk
+        self.out_num = 9
+        self.middle_layer_size = 1024
+        self.lstm = nn.LSTM(5, self.middle_layer_size)#idle move atk
+        self.hidden = nn.Linear(self.middle_layer_size,self.out_num)
  
     
     def forward(self, inputs):
@@ -23,7 +25,9 @@ class LSTM_Module(nn.Module):
         t = t.view(len(inputs),1,-1)
         
         lstm_outs,_ = self.lstm(t)
-        out = F.log_softmax(lstm_outs[-1], dim=1)
+        lstm_out = lstm_outs[-1]
+        lstm_out = F.tanh(lstm_out)
+        out = F.log_softmax(self.hidden(lstm_out), dim=1)
         return out
 
 class DefaultGameEnv(game_env.GameEnv):
@@ -33,14 +37,26 @@ class DefaultGameEnv(game_env.GameEnv):
         random.seed(time.time())
 
         self.lstm_module = LSTM_Module()
-        self.optimizer = optim.SGD(self.lstm_module.parameters(), lr=0.01)
+        self.optimizer = optim.SGD(self.lstm_module.parameters(), lr=0.05)
 
         self.losses = []
-        self.batch_size = 1000
-        self.buffer_size = 100000
+        self.batch_size = 256
+        self.buffer_size = 1000
         self.i = 0
 
         self.loss_fn = nn.NLLLoss()
+    
+    def train(self):
+        #just make it simple
+        self.lstm_module.zero_grad()
+        random.shuffle(self.losses)
+        if len(self.losses) > self.buffer_size:
+            self.losses = self.losses[:self.buffer_size]
+        buf = self.losses[:self.batch_size]
+        avg_loss = (sum(buf)/self.batch_size)
+        print(avg_loss.float())
+        avg_loss.backward(retain_graph=True)
+        self.optimizer.step()
 
     def _generator_run(self, input_):
         self.init_fn(input_)
@@ -49,7 +65,7 @@ class DefaultGameEnv(game_env.GameEnv):
             actionspace_name='lattice1',
             canvas=self.canvas)        
 
-        while self.engine.get_time() < 120:
+        while self.engine.get_time() < 200:
             self.i = self.i + 1
 
             dire_predefine_step = self.engine.predefined_step("Dire",0)
@@ -66,19 +82,15 @@ class DefaultGameEnv(game_env.GameEnv):
             loss = self.loss_fn(out, predefine_move)
             self.losses.append(loss)
 
-            self.engine.set_order("Dire", 0, (1,torch.max(out,1)[1].numpy()[0]))
+            order = torch.max(out,1)[1].numpy()[0]
+
+            if random.random() < 0.5:
+                order = random.randint(0, 8)
+
+            self.engine.set_order("Dire", 0, (1,order))
 
             if self.i % self.batch_size == 0:
-                #just make it simple
-                self.lstm_module.zero_grad()
-                random.shuffle(self.losses)
-                self.losses = self.losses[:self.buffer_size]
-                buf = self.losses[:self.batch_size]
-                avg_loss = (sum(buf)/self.batch_size)
-                print(avg_loss.float(), out, predefine_move)
-                avg_loss.backward()
-                self.optimizer.step()
-                self.losses = []
+                self.train()
 
             yield
 
