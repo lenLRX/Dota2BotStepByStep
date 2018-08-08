@@ -94,6 +94,7 @@ class A3CSpliterEnv(game_env.GameEnv):
         self.out_classes = 9
 
         self.a3c_model = ActorCritic(5, self.out_classes, 64)
+        self.a3c_model.load_state_dict(torch.load('F:\Dota2BotStepByStep\model_4400'))
         self.optimizer = optim.SGD(self.a3c_model.parameters(), lr=0.01)
         
         self.reset()
@@ -164,9 +165,6 @@ class A3CSpliterEnv(game_env.GameEnv):
 
         print("reward %f"%sum(self.rewards))
 
-        if self.game_no % 100 == 0:
-            torch.save(self.a3c_model.state_dict(), "./tmp/model_%d"%self.game_no)
-
         writer.add_scalar("train/loss",total_loss.item())
         writer.add_scalar("train/policy_loss",policy_loss.item() / len(self.raw_probs))
         writer.add_scalar("train/policy_loss",value_loss.item() / len(self.raw_probs))
@@ -190,7 +188,7 @@ class A3CSpliterEnv(game_env.GameEnv):
         self.reset()
         self.sw.reset()
 
-        while self.engine.get_time() < 200:
+        while self.engine.get_time() < 300:
             self.i = self.i + 1
             
             #print(dire_predefine_step)

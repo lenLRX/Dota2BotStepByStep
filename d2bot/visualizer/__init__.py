@@ -1,1 +1,4 @@
-from .visualizer import Visualizer
+try:
+    from .visualizer import Visualizer
+except:
+    pass
