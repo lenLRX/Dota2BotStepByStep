@@ -169,7 +169,7 @@ class A3CSpliterEnv(game_env.GameEnv):
 
         writer.add_scalar("train/loss",total_loss.item())
         writer.add_scalar("train/policy_loss",policy_loss.item() / len(self.raw_probs))
-        writer.add_scalar("train/policy_loss",value_loss.item() / len(self.raw_probs))
+        writer.add_scalar("train/value_loss",value_loss.item() / len(self.raw_probs))
         writer.add_scalar("train/teacher_loss",teacher_loss.item() / len(self.raw_probs))
         writer.add_scalar("train/rewards",sum(self.rewards))
         writer.add_scalar("train/values",sum(self.values).item() / len(self.values))
