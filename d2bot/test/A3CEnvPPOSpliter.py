@@ -107,7 +107,7 @@ class A3CSpliterPPOEnv(game_env.GameEnv):
         self.buffer_size = 1000
         self.i = 0
 
-        self.update_steps = 10
+        self.update_steps = 3
 
         self.nll_loss_fn = nn.NLLLoss()
 
@@ -149,18 +149,19 @@ class A3CSpliterPPOEnv(game_env.GameEnv):
         random.shuffle(idxs)
         idxs = idxs[:self.batch_size]
 
+        total_r = 0.0
+
         #TODO: turn `for loop` to tensor operations
         for i in idxs:
             new_prob, v = self.a3c_model(self.states[i])
             new_prob = F.softmax(new_prob)
             old_prob, _ = old_model(self.states[i])
-            new_prob = F.softmax(old_prob)
-            adv = reduced_r[i] - v
+            old_prob = F.softmax(old_prob)
+            adv = reduced_r[i] - v.data
             onehot_act = torch.zeros(self.out_classes)
             onehot_act[self.actions[i]] = 1
 
-            ratio = (new_prob * onehot_act) / (old_prob * onehot_act)
-            ratio = torch.sum(ratio)
+            ratio = torch.sum(new_prob * onehot_act) / torch.sum(old_prob * onehot_act)
             surr = ratio * adv
 
             l = l - min(surr, torch.clamp(ratio, 1.0 - self.epsilon, 1.0 + self.epsilon)*adv)
@@ -168,7 +169,7 @@ class A3CSpliterPPOEnv(game_env.GameEnv):
         l = l / self.batch_size
         
         l.backward(retain_graph=True)
-        writer.add_scalar("train/policy_loss", l.item() / len(self.raw_probs))
+        writer.add_scalar("train/policy_loss", l.item() / self.batch_size)
         self.optimizer.step()
 
     
@@ -182,6 +183,7 @@ class A3CSpliterPPOEnv(game_env.GameEnv):
         teacher_loss = torch.cat(self.raw_probs)
         teacher_loss = teacher_loss - torch.zeros(len(self.predefined_steps),self.out_classes).scatter_(1, torch.cat(self.predefined_steps).view(-1,1), 1)
         teacher_loss = torch.sum(teacher_loss ** 2)
+        teacher_loss = teacher_loss / len(self.raw_probs)
         teacher_loss.backward()
 
         writer.add_scalar("train/teacher_loss",teacher_loss.item() / len(self.raw_probs))
@@ -212,10 +214,10 @@ class A3CSpliterPPOEnv(game_env.GameEnv):
             adv = reduced_r[i] - self.a3c_model(self.states[i])[1]
             l = l + adv ** 2
         
-        l = l / len(self.rewards)
+        l = l / self.batch_size
         l.backward(retain_graph=True)
 
-        writer.add_scalar("train/value_loss", l.item() / len(self.raw_probs))
+        writer.add_scalar("train/value_loss", l.item() / self.batch_size)
         self.optimizer.step()
     
     def train(self):
