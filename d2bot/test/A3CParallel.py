@@ -1,6 +1,7 @@
 import d2bot.visualizer as visualizer
 import d2bot.core.game_env as game_env
 import d2bot.simulator as simulator
+import d2bot.core.parallel as parallel
 
 from d2bot.torch.a3c.ActorCritic import ActorCritic
 
@@ -8,93 +9,34 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.multiprocessing as mp
 from torch.autograd import Variable
 
 import random
 import time
 import sys
+import os
+import math
 
 from tensorboardX import SummaryWriter
-writer = SummaryWriter()
 
 '''
     model from https://github.com/ikostrikov/pytorch-a3c
 '''
 
-
-class Spliter(torch.nn.Module):
-
-    def __init__(self, num_inputs, num_hidden):
-        super(Spliter, self).__init__()
-
-        self.num_hidden = num_hidden
-        self.num_inputs = num_inputs
-        self.num_outs = 2
-
-        self.lstm_layer = nn.LSTM(num_inputs, self.num_hidden)
-
-        self.linear = nn.Linear(self.num_hidden, self.num_outs)
-        self.train()
-    
-    def forward(self, inputs):
-        t = torch.FloatTensor(inputs)
-        t = t.view(len(inputs),1,-1)
-        
-        lstm_outs,_ = self.lstm_layer(t)
-        lstm_out = lstm_outs[-1]
-        lstm_out = F.tanh(lstm_out)
-        out = self.linear(lstm_out)
-        return out
-
-class SpliterWarpper:
-    def __init__(self,num_inputs, num_hidden):
-        self.nn_spliter = Spliter(num_inputs, num_hidden)
-        self.optimizer = optim.SGD(self.nn_spliter.parameters(), lr=0.01)
-        self.outs = []
-        self.nll_loss_fn = nn.NLLLoss()
-    
-    def reset(self):
-        self.outs.clear()
-    
-    def step(self, inputs):
-        out = F.log_softmax(self.nn_spliter(inputs))
-        self.outs.append(out)
-    
-    def train(self, labels):
-        assert(len(labels) == len(self.outs))
-        labels = labels.type(torch.LongTensor)
-        loss = self.nll_loss_fn(torch.cat(self.outs),labels) / len(labels)
-        pred = torch.cat(self.outs)
-        score = torch.argmax(pred,1) == labels
-        print(loss, 
-            float(sum(score).numpy()) / len(labels),
-            float(sum(labels).numpy()) / len(labels))
-        
-        writer.add_scalar("train/spliter_loss",loss.item())
-        writer.add_scalar("train/spliter_score",sum(score).item() / len(labels))
-        writer.add_scalar("train/acc",sum(score).item() / len(labels))
-
-        loss.backward()
-        self.reset()
-    
-    def update(self):
-        self.optimizer.step()
-        self.optimizer.zero_grad()
-        self.nn_spliter.zero_grad()
-
-
-class A3CSpliterPPOEnv(game_env.GameEnv):
+class ParallelA3CPPOEnv(game_env.GameEnv):
     def __init__(self, *args, **kwargs):
-        super(A3CSpliterPPOEnv,self).__init__(*args, **kwargs)
+        super(ParallelA3CPPOEnv,self).__init__(*args, **kwargs)
 
-        random.seed(time.time())
+        random.seed(os.getpid())
+        torch.random.manual_seed(os.getpid())
 
         self.game_no = 0
 
         self.out_classes = 9
 
         self.a3c_model = ActorCritic(5, self.out_classes, 64)
-        self.optimizer = optim.SGD(self.a3c_model.parameters(), lr=0.1)
+        self.optimizer = optim.SGD(self.a3c_model.parameters(), lr=0.001)
         
         self.reset()
 
@@ -111,8 +53,19 @@ class A3CSpliterPPOEnv(game_env.GameEnv):
 
         self.nll_loss_fn = nn.NLLLoss()
 
-        self.sw = SpliterWarpper(5, 128)
-        
+        self.writer = SummaryWriter(comment='_%d'%os.getpid())
+
+        self.rank=-1
+    
+    def set_rank(self, rank):
+        self.rank = rank
+    
+    def set_model(self, model):
+        self.a3c_model = model
+        self.optimizer = optim.SGD(self.a3c_model.parameters(), lr=0.1)
+    
+    def get_model(self):
+        return self.a3c_model
     
     def reset(self):
         self.states = []
@@ -130,6 +83,8 @@ class A3CSpliterPPOEnv(game_env.GameEnv):
         self.optimizer.step()
         self.a3c_model.zero_grad()
         self.optimizer.zero_grad()
+    
+    
     
     def ppo_train_actor(self, old_model):
         self.a3c_model.zero_grad()
@@ -149,8 +104,6 @@ class A3CSpliterPPOEnv(game_env.GameEnv):
         random.shuffle(idxs)
         idxs = idxs[:self.batch_size]
 
-        total_r = 0.0
-
         #TODO: turn `for loop` to tensor operations
         for i in idxs:
             new_prob, v = self.a3c_model(self.states[i])
@@ -169,27 +122,8 @@ class A3CSpliterPPOEnv(game_env.GameEnv):
         l = l / self.batch_size
         
         l.backward(retain_graph=True)
-        writer.add_scalar("train/policy_loss", l.item() / self.batch_size)
+        self.writer.add_scalar("train/policy_loss", l.item())
         self.optimizer.step()
-
-    
-    def teacher_train(self):
-        #TODO: teacher_loss * (1 - Gini coefficient)
-        #TODO: entropy loss
-        self.a3c_model.zero_grad()
-        self.optimizer.zero_grad()
-        teacher_loss = 0
-
-        teacher_loss = torch.cat(self.raw_probs)
-        teacher_loss = teacher_loss - torch.zeros(len(self.predefined_steps),self.out_classes).scatter_(1, torch.cat(self.predefined_steps).view(-1,1), 1)
-        teacher_loss = torch.sum(teacher_loss ** 2)
-        teacher_loss = teacher_loss / len(self.raw_probs)
-        teacher_loss.backward()
-
-        writer.add_scalar("train/teacher_loss",teacher_loss.item() / len(self.raw_probs))
-
-        self.optimizer.step()
-
     
     def ppo_train_critic(self):
         
@@ -217,15 +151,42 @@ class A3CSpliterPPOEnv(game_env.GameEnv):
         l = l / self.batch_size
         l.backward(retain_graph=True)
 
-        writer.add_scalar("train/value_loss", l.item())
+        self.writer.add_scalar("train/value_loss", l.item())
+        self.optimizer.step()
+    
+    def teacher_train(self):
+        #TODO: teacher_loss * (1 - Gini coefficient)
+        #TODO: entropy loss
+        self.a3c_model.zero_grad()
+        self.optimizer.zero_grad()
+        teacher_loss = 0
+
+        labels = torch.cat(self.predefined_steps)
+
+        #balance loss
+        weight = torch.zeros((self.out_classes,))
+        for i in range(self.out_classes):
+            weight[i] = torch.sum(labels==i)
+            if weight[i] > 0:
+                weight[i] = 1./ weight[i]
+        
+        nll = nn.NLLLoss(weight=weight)
+
+        log_probs =  torch.cat(self.raw_log_probs)
+
+        teacher_loss = nll(log_probs, labels) * 0.1#0.1 as coeff
+        teacher_loss.backward(retain_graph=True)
+
+        self.writer.add_scalar("train/teacher_loss",teacher_loss.item() )
+
         self.optimizer.step()
     
     def train(self):
         #just make it simple
+        self.a3c_model.train()
 
         old_model = self.a3c_model.clone()
 
-        #TODO:move it to the last
         self.teacher_train()
 
         for _ in range(self.update_steps):
@@ -236,16 +197,12 @@ class A3CSpliterPPOEnv(game_env.GameEnv):
         
         print("reward %f"%sum(self.rewards))
 
-        if self.game_no % 100 == 0:
-            torch.save(self.a3c_model.state_dict(), "./tmp/model_%d"%self.game_no)
-
-        writer.add_scalar("train/rewards",sum(self.rewards))
-        writer.add_scalar("train/values",sum(self.values).item() / len(self.values))
-        writer.add_scalar("train/entropy",sum(self.entropies).item() / len(self.entropies))
+        self.writer.add_scalar("train/rewards",sum(self.rewards))
+        self.writer.add_scalar("train/values",sum(self.values).item() / len(self.values))
+        self.writer.add_scalar("train/entropy",sum(self.entropies).item() / len(self.entropies))
 
         acts = torch.cat(self.raw_log_probs)
         pd = torch.tensor(self.predefined_steps)
-        self.sw.train(torch.argmax(acts,1) == pd)
 
     def _generator_run(self, input_):
         self.game_no = self.game_no + 1
@@ -256,7 +213,6 @@ class A3CSpliterPPOEnv(game_env.GameEnv):
             canvas=self.canvas)
         
         self.reset()
-        self.sw.reset()
 
         while self.engine.get_time() < 200:
             self.i = self.i + 1
@@ -275,8 +231,6 @@ class A3CSpliterPPOEnv(game_env.GameEnv):
             state_now = dire_state[0]
             self.states.append(state_now)
             action_out, value_out = self.a3c_model(state_now)
-
-            self.sw.step(state_now)
             
             prob = F.softmax(action_out)
             self.raw_probs.append(prob)
@@ -287,8 +241,9 @@ class A3CSpliterPPOEnv(game_env.GameEnv):
             self.entropies.append(entropy)
 
             action = prob.multinomial(num_samples=1).data
-            self.actions.append(action)
+
             #action = torch.argmax(log_prob, 1).data.view(-1,1)
+            self.actions.append(action)
             log_prob = log_prob.gather(1,Variable(action))
 
             self.engine.set_order("Dire", 0, (1,action))
@@ -302,27 +257,41 @@ class A3CSpliterPPOEnv(game_env.GameEnv):
             
 
             yield
-        
-
-        self.train()
+        print("rank %d os.pid %d"%(self.rank,os.getpid()))
+        if self.rank != 0:
+            
+            self.train()
 
 def test():
-    v = visualizer.Visualizer(A3CSpliterPPOEnv)
+    v = visualizer.Visualizer(ParallelA3CPPOEnv)
     v.visualize()
 
-def test_without_gui():
-    env = A3CSpliterPPOEnv()
+def test_without_gui(clazz, model, rank, args):
+    #1 trainer per cpu core
+    os.environ['OMP_NUM_THREADS'] = '1'
+    print("rank %d os.pid=%d"%(rank, os.getpid()))
+    env = clazz()
+    env.set_model(model)
+    env.set_rank(rank)
+        
+
     gen = env.run(True)
     gen.send(None)
     while True:
         try:
             gen.send((None,))
         except StopIteration:
+            if rank == 0:
+                torch.save(env.a3c_model.state_dict(), "./tmp/model_%d_%d"%(env.game_no, os.getpid()))
             gen = env.run(True)
             gen.send(None)
 
 if __name__ == '__main__':
-    if len(sys.argv) == 2:
-        if sys.argv[1] == "visible":
-            test()
-    test_without_gui()
+    model = ActorCritic(5, 9, 64)
+    import torch.nn.init as weight_init
+    for name, param in model.named_parameters(): 
+        weight_init.normal(param); 
+    model.share_memory()
+
+    parallel.start_parallel(ParallelA3CPPOEnv, model, np=os.cpu_count(), func=test_without_gui, args=None)
+

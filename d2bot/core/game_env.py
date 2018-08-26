@@ -66,6 +66,12 @@ class GameEnv:
     def _default_step_fn(self, arg=None):
         #print('_default_step_fn')
         return None
+    
+    def set_model(self, model):
+        raise NotImplementedError
+    
+    def get_model(self):
+        raise NotImplementedError
 
 def test_fn():
     game_env = GameEnv()

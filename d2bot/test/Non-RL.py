@@ -83,9 +83,9 @@ class SpliterWarpper:
         self.nn_spliter.zero_grad()
 
 
-class A3CSpliterEnv(game_env.GameEnv):
+class A3CSpliterPPOEnv(game_env.GameEnv):
     def __init__(self, *args, **kwargs):
-        super(A3CSpliterEnv,self).__init__(*args, **kwargs)
+        super(A3CSpliterPPOEnv,self).__init__(*args, **kwargs)
 
         random.seed(time.time())
 
@@ -94,18 +94,20 @@ class A3CSpliterEnv(game_env.GameEnv):
         self.out_classes = 9
 
         self.a3c_model = ActorCritic(5, self.out_classes, 64)
-        self.a3c_model.load_state_dict(torch.load('F:\\Dota2BotStepByStep\\tmp\\model_432_46968'))
-        self.optimizer = optim.SGD(self.a3c_model.parameters(), lr=0.01)
+        self.optimizer = optim.SGD(self.a3c_model.parameters(), lr=0.001)
         
         self.reset()
 
         self.gamma = 0.99
         self.tau = 1.0
         self.entropy_coef = 0.01
+        self.epsilon = 0.2
 
         self.batch_size = 256
         self.buffer_size = 1000
         self.i = 0
+
+        self.update_steps = 3
 
         self.nll_loss_fn = nn.NLLLoss()
 
@@ -113,6 +115,8 @@ class A3CSpliterEnv(game_env.GameEnv):
         
     
     def reset(self):
+        self.states = []
+        self.actions = []
         self.entropies = []
         self.values = []
         self.rewards = []
@@ -126,56 +130,125 @@ class A3CSpliterEnv(game_env.GameEnv):
         self.optimizer.step()
         self.a3c_model.zero_grad()
         self.optimizer.zero_grad()
-        self.sw.update()
+    
+    def ppo_train_actor(self, old_model):
+        self.a3c_model.zero_grad()
+        self.optimizer.zero_grad()
+
+        l = 0.0
+        R = torch.zeros(1, 1)
+
+        reduced_r = []
+        for i in reversed(range(len(self.rewards))):
+            R = self.gamma * R + self.rewards[i]
+            reduced_r.append(R)
+        
+        reduced_r = list(reversed(reduced_r))
+
+        idxs = list(range(len(self.rewards)))
+        random.shuffle(idxs)
+        idxs = idxs[:self.batch_size]
+
+        total_r = 0.0
+
+        #TODO: turn `for loop` to tensor operations
+        for i in idxs:
+            new_prob, v = self.a3c_model(self.states[i])
+            new_prob = F.softmax(new_prob)
+            old_prob, _ = old_model(self.states[i])
+            old_prob = F.softmax(old_prob)
+            adv = reduced_r[i] - v.data
+            onehot_act = torch.zeros(self.out_classes)
+            onehot_act[self.actions[i]] = 1
+
+            ratio = torch.sum(new_prob * onehot_act) / torch.sum(old_prob * onehot_act)
+            surr = ratio * adv
+
+            l = l - min(surr, torch.clamp(ratio, 1.0 - self.epsilon, 1.0 + self.epsilon)*adv)
+        
+        l = l / self.batch_size
+        
+        l.backward(retain_graph=True)
+        writer.add_scalar("train/policy_loss", l.item())
+        self.optimizer.step()
+
+    
+    def teacher_train(self):
+        #TODO: teacher_loss * (1 - Gini coefficient)
+        #TODO: entropy loss
+        self.a3c_model.zero_grad()
+        self.optimizer.zero_grad()
+        teacher_loss = 0
+
+        labels = torch.cat(self.predefined_steps)
+
+        #balance loss
+        weight = torch.zeros((self.out_classes,))
+        for i in range(self.out_classes):
+            weight[i] = torch.sum(labels==i)
+            if weight[i] > 0:
+                weight[i] = 1./ weight[i]
+        
+        nll = nn.NLLLoss(weight=weight)
+
+        log_probs =  torch.cat(self.raw_log_probs)
+
+        teacher_loss = nll(log_probs, labels)
+        teacher_loss.backward(retain_graph=True)
+
+        writer.add_scalar("train/teacher_loss",teacher_loss.item() )
+
+        self.optimizer.step()
+
+    
+    def ppo_train_critic(self):
+        
+        self.a3c_model.zero_grad()
+        self.optimizer.zero_grad()
+
+        R = torch.zeros(1, 1)
+        l = 0.0
+
+        reduced_r = []
+        for i in reversed(range(len(self.rewards))):
+            R = self.gamma * R + self.rewards[i]
+            reduced_r.append(R)
+        
+        reduced_r = list(reversed(reduced_r))
+
+        idxs = list(range(len(self.rewards)))
+        random.shuffle(idxs)
+        idxs = idxs[:self.batch_size]
+
+        for i in idxs:
+            adv = reduced_r[i] - self.a3c_model(self.states[i])[1]
+            l = l + adv ** 2
+        
+        l = l / self.batch_size
+        l.backward(retain_graph=True)
+
+
+        writer.add_scalar("train/value_loss", l.item())
+        self.optimizer.step()
     
     def train(self):
         #just make it simple
+
+        old_model = self.a3c_model.clone()
+
+        #TODO:move it to the last
+        self.teacher_train()
         
-        R = torch.zeros(1, 1)
-        gae = torch.zeros(1, 1)
-
-        self.values.append(R)
-
-        policy_loss = 0
-        value_loss = 0
-        teacher_loss = 0
-
-        for i in reversed(range(len(self.rewards))):
-            R = self.gamma * R + self.rewards[i]
-            adv = R - self.values[i]
-            value_loss = value_loss + 0.5 * adv.pow(2)
-
-            #GAE
-            delta_t = self.rewards[i] + self.gamma * self.values[i + 1].data - self.values[i].data
-            gae = gae * self.gamma * self.tau + delta_t
-
-            policy_loss = policy_loss - self.log_probs[i] * Variable(gae) - self.entropy_coef * self.entropies[i]
-
-            #teacher_loss = teacher_loss + self.nll_loss_fn(self.raw_log_probs[i], self.predefined_steps[i])
-        
-        teacher_loss = torch.cat(self.raw_probs)
-        teacher_loss = teacher_loss - torch.zeros(len(self.predefined_steps),self.out_classes).scatter_(1, torch.cat(self.predefined_steps).view(-1,1), 1)
-        teacher_loss = torch.sum(teacher_loss ** 2)
-
-        total_loss = (policy_loss + 0.5 * value_loss + teacher_loss)
-        total_loss = total_loss / len(self.raw_probs)
-        #print(total_loss)
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm(self.a3c_model.parameters(), 10)
-
         print("reward %f"%sum(self.rewards))
 
-        writer.add_scalar("train/loss",total_loss.item())
-        writer.add_scalar("train/policy_loss",policy_loss.item() / len(self.raw_probs))
-        writer.add_scalar("train/policy_loss",value_loss.item() / len(self.raw_probs))
-        writer.add_scalar("train/teacher_loss",teacher_loss.item() / len(self.raw_probs))
+        if self.game_no % 100 == 0:
+            torch.save(self.a3c_model.state_dict(), "./tmp/model_%d"%self.game_no)
+
         writer.add_scalar("train/rewards",sum(self.rewards))
         writer.add_scalar("train/values",sum(self.values).item() / len(self.values))
         writer.add_scalar("train/entropy",sum(self.entropies).item() / len(self.entropies))
 
-        acts = torch.cat(self.raw_log_probs)
-        pd = torch.tensor(self.predefined_steps)
-        self.sw.train(torch.argmax(acts,1) == pd)
+
 
     def _generator_run(self, input_):
         self.game_no = self.game_no + 1
@@ -188,7 +261,7 @@ class A3CSpliterEnv(game_env.GameEnv):
         self.reset()
         self.sw.reset()
 
-        while self.engine.get_time() < 300:
+        while self.engine.get_time() < 200:
             self.i = self.i + 1
             
             #print(dire_predefine_step)
@@ -202,22 +275,25 @@ class A3CSpliterEnv(game_env.GameEnv):
                 break
             
             self.predefined_steps.append(predefine_move)
-            action_out, value_out = self.a3c_model(dire_state[0])
+            state_now = dire_state[0]
+            self.states.append(state_now)
+            action_out, value_out = self.a3c_model(state_now)
 
-            self.sw.step(dire_state[0])
+            self.sw.step(state_now)
             
             prob = F.softmax(action_out)
             self.raw_probs.append(prob)
             log_prob = F.log_softmax(action_out)
             self.raw_log_probs.append(log_prob)
-            
 
             entropy = - (log_prob * prob).sum(1, keepdim=True)
             self.entropies.append(entropy)
 
-            action = prob.multinomial(num_samples=1).data
-            #action = torch.argmax(log_prob, 1).data.view(-1,1)
+            #action = prob.multinomial(num_samples=1).data
+            
+            action = torch.argmax(log_prob, 1).data.view(-1,1)
             log_prob = log_prob.gather(1,Variable(action))
+            self.actions.append(action)
 
             self.engine.set_order("Dire", 0, (1,action))
 
@@ -233,14 +309,13 @@ class A3CSpliterEnv(game_env.GameEnv):
         
 
         self.train()
-        self.update()
 
 def test():
-    v = visualizer.Visualizer(A3CSpliterEnv)
+    v = visualizer.Visualizer(A3CSpliterPPOEnv)
     v.visualize()
 
 def test_without_gui():
-    env = A3CSpliterEnv()
+    env = A3CSpliterPPOEnv()
     gen = env.run(True)
     gen.send(None)
     while True:
