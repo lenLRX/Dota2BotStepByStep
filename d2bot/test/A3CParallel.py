@@ -62,7 +62,7 @@ class ParallelA3CPPOEnv(game_env.GameEnv):
     
     def set_model(self, model):
         self.a3c_model = model
-        self.optimizer = optim.SGD(self.a3c_model.parameters(), lr=0.1)
+        self.optimizer = optim.SGD(self.a3c_model.parameters(), lr=0.001)
     
     def get_model(self):
         return self.a3c_model
@@ -214,7 +214,7 @@ class ParallelA3CPPOEnv(game_env.GameEnv):
         
         self.reset()
 
-        while self.engine.get_time() < 200:
+        while self.engine.get_time() < 500:
             self.i = self.i + 1
             
             #print(dire_predefine_step)

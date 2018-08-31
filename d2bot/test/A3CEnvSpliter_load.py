@@ -94,7 +94,7 @@ class A3CSpliterEnv(game_env.GameEnv):
         self.out_classes = 9
 
         self.a3c_model = ActorCritic(5, self.out_classes, 64)
-        self.a3c_model.load_state_dict(torch.load('F:\\Dota2BotStepByStep\\tmp\\model_432_46968'))
+        self.a3c_model.load_state_dict(torch.load('F:\\Dota2BotStepByStep\\tmp\\model_3453_6240'))
         self.optimizer = optim.SGD(self.a3c_model.parameters(), lr=0.01)
         
         self.reset()
