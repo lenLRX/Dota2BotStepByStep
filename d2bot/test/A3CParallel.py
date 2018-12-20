@@ -24,6 +24,9 @@ from tensorboardX import SummaryWriter
     model from https://github.com/ikostrikov/pytorch-a3c
 '''
 
+lr = 0.01
+num_hidden = 32
+
 class ParallelA3CPPOEnv(game_env.GameEnv):
     def __init__(self, *args, **kwargs):
         super(ParallelA3CPPOEnv,self).__init__(*args, **kwargs)
@@ -35,12 +38,12 @@ class ParallelA3CPPOEnv(game_env.GameEnv):
 
         self.out_classes = 9
 
-        self.a3c_model = ActorCritic(5, self.out_classes, 64)
-        self.optimizer = optim.SGD(self.a3c_model.parameters(), lr=0.001)
+        self.a3c_model = ActorCritic(5, self.out_classes, num_hidden)
+        self.optimizer = optim.SGD(self.a3c_model.parameters(), lr=lr)
         
         self.reset()
 
-        self.gamma = 0.99
+        self.gamma = 0.9
         self.tau = 1.0
         self.entropy_coef = 0.01
         self.epsilon = 0.2
@@ -49,7 +52,7 @@ class ParallelA3CPPOEnv(game_env.GameEnv):
         self.buffer_size = 1000
         self.i = 0
 
-        self.update_steps = 3
+        self.update_steps = 0
 
         self.nll_loss_fn = nn.NLLLoss()
 
@@ -62,7 +65,7 @@ class ParallelA3CPPOEnv(game_env.GameEnv):
     
     def set_model(self, model):
         self.a3c_model = model
-        self.optimizer = optim.SGD(self.a3c_model.parameters(), lr=0.001)
+        self.optimizer = optim.SGD(self.a3c_model.parameters(), lr=lr)
     
     def get_model(self):
         return self.a3c_model
@@ -178,6 +181,7 @@ class ParallelA3CPPOEnv(game_env.GameEnv):
         teacher_loss.backward(retain_graph=True)
 
         self.writer.add_scalar("train/teacher_loss",teacher_loss.item() )
+        print("train/teacher_loss",teacher_loss.item())
 
         self.optimizer.step()
     
@@ -214,7 +218,7 @@ class ParallelA3CPPOEnv(game_env.GameEnv):
         
         self.reset()
 
-        while self.engine.get_time() < 500:
+        while self.engine.get_time() < 30:
             self.i = self.i + 1
             
             #print(dire_predefine_step)
@@ -240,9 +244,9 @@ class ParallelA3CPPOEnv(game_env.GameEnv):
             entropy = - (log_prob * prob).sum(1, keepdim=True)
             self.entropies.append(entropy)
 
-            action = prob.multinomial(num_samples=1).data
+            #action = prob.multinomial(num_samples=1).data
 
-            #action = torch.argmax(log_prob, 1).data.view(-1,1)
+            action = torch.argmax(log_prob, 1).data.view(-1,1)
             self.actions.append(action)
             log_prob = log_prob.gather(1,Variable(action))
 
@@ -258,13 +262,14 @@ class ParallelA3CPPOEnv(game_env.GameEnv):
 
             yield
         print("rank %d os.pid %d"%(self.rank,os.getpid()))
-        if self.rank != 0:
-            
-            self.train()
+        self.train()
+        torch.save(self.a3c_model.state_dict(), "./tmp/model_%d_%d"%(self.game_no, os.getpid()))
 
-def test():
+def test(model):
     v = visualizer.Visualizer(ParallelA3CPPOEnv)
+    v.env.set_model(model)
     v.visualize()
+    
 
 def test_without_gui(clazz, model, rank, args):
     #1 trainer per cpu core
@@ -287,11 +292,12 @@ def test_without_gui(clazz, model, rank, args):
             gen.send(None)
 
 if __name__ == '__main__':
-    model = ActorCritic(5, 9, 64)
+    model = ActorCritic(5, 9, num_hidden)
     import torch.nn.init as weight_init
     for name, param in model.named_parameters(): 
         weight_init.normal(param); 
     model.share_memory()
+    test(model)
 
-    parallel.start_parallel(ParallelA3CPPOEnv, model, np=os.cpu_count(), func=test_without_gui, args=None)
+    #parallel.start_parallel(ParallelA3CPPOEnv, model, np=os.cpu_count(), func=test_without_gui, args=None)
 

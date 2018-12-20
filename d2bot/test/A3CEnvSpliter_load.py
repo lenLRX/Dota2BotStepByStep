@@ -93,8 +93,8 @@ class A3CSpliterEnv(game_env.GameEnv):
 
         self.out_classes = 9
 
-        self.a3c_model = ActorCritic(5, self.out_classes, 64)
-        self.a3c_model.load_state_dict(torch.load('F:\\Dota2BotStepByStep\\tmp\\model_3453_6240'))
+        self.a3c_model = ActorCritic(5, self.out_classes, 128)
+        self.a3c_model.load_state_dict(torch.load('F:\\Dota2BotStepByStep\\tmp\\model_3023_24392'))
         self.optimizer = optim.SGD(self.a3c_model.parameters(), lr=0.01)
         
         self.reset()
@@ -215,8 +215,8 @@ class A3CSpliterEnv(game_env.GameEnv):
             entropy = - (log_prob * prob).sum(1, keepdim=True)
             self.entropies.append(entropy)
 
-            action = prob.multinomial(num_samples=1).data
-            #action = torch.argmax(log_prob, 1).data.view(-1,1)
+            #action = prob.multinomial(num_samples=1).data
+            action = torch.argmax(log_prob, 1).data.view(-1,1)
             log_prob = log_prob.gather(1,Variable(action))
 
             self.engine.set_order("Dire", 0, (1,action))
