@@ -5,14 +5,15 @@ import math
 import os
 import math
 import random
-import threading
-
+import shutil
 
 import torch.multiprocessing as mp
 
 from grpclib.client import Channel
 from google.protobuf.json_format import MessageToDict
 from tensorboardX import SummaryWriter
+
+from pympler.tracker import SummaryTracker
 
 from dotaservice.protos.DotaService_grpc import DotaServiceStub
 from dotaservice.protos.dota_gcmessages_common_bot_script_pb2 import CMsgBotWorldState
@@ -28,10 +29,51 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-from d2bot.torch.a3c.ActorCritic import ActorCritic
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class ActorNCritic(torch.nn.Module):
+
+    def __init__(self, num_inputs, action_space, num_hidden):
+        super(ActorNCritic, self).__init__()
+
+        self.num_hidden = num_hidden
+        self.num_inputs = num_inputs
+        self.action_space = action_space
+
+        self.a_lstm_layer = nn.LSTM(num_inputs, self.num_hidden)
+        self.c_lstm_layer = nn.LSTM(num_inputs, self.num_hidden)
+
+        self.critic_linear = nn.Linear(self.num_hidden, 1)
+        self.actor_linear  = nn.Linear(self.num_hidden, self.action_space)
+        self.train()
+    
+    def forward(self, inputs):
+        t = torch.FloatTensor(inputs)
+        t = t.view(len(inputs),1,-1)
+        
+        a_lstm_outs,_ = self.a_lstm_layer(t)
+        a_lstm_out = a_lstm_outs[-1]
+        a_lstm_out = F.tanh(a_lstm_out)
+        actor_out = self.actor_linear(a_lstm_out)
+
+        c_lstm_outs,_ = self.c_lstm_layer(t)
+        c_lstm_out = c_lstm_outs[-1]
+        c_lstm_out = F.tanh(c_lstm_out)
+        critic_out = self.critic_linear(c_lstm_out)
+        return actor_out, critic_out
+    
+    def clone(self):
+        m = ActorNCritic(self.num_inputs, self.action_space, self.num_hidden)
+        m.load_state_dict(self.state_dict())
+        return m
 
 lr = 1e-3
-num_hidden = 128
+num_hidden = 16
+
+MODE_NORMAL=0
+MODE_AUTO=1
 
 
 config = Config(
@@ -121,17 +163,19 @@ def get_reward(prev_state, state):
     reward['lh'] = lh * 0.5
 
     # Help him get to mid, for minor speed boost
+
     dt = state.dota_time - prev_state.dota_time
     dist_mid_init = math.sqrt(unit_init.location.x**2 + unit_init.location.y**2)
     dist_mid = math.sqrt(unit.location.x**2 + unit.location.y**2)
-    reward['dist'] = (dist_mid_init - dist_mid) /\
+    reward_dist = (dist_mid_init - dist_mid) /\
     ((unit_init.base_movement_speed + unit.base_movement_speed) * dt) * 0.1
+
 
     #print(dt, reward['dist'])
 
     total_reward = sum(reward.values())
 
-    return total_reward
+    return total_reward, reward_dist
 
 def calc_reward(state, prev_state):
     return get_reward(prev_state, state)
@@ -144,26 +188,31 @@ config = Config(
 
 class DotaServiceEnv(object):
 
-    def __init__(self, config, host, port):
+    def __init__(self, rank, config, host, port):
         loop = asyncio.get_event_loop()
         channel = Channel(host, port, loop=loop)
         self.env = DotaServiceStub(channel) # place holder
         self.config = config
 
-        self.gamma = 0.99
+        self.gamma = 0.7
+        self.gamma_dist = 0.
         self.tau = 1.0
         self.entropy_coef = 0.01
         self.epsilon = 0.2
 
-        self.batch_size = 256
         self.buffer_size = 1000
 
         self.out_classes = 9
 
-        self.update_steps = 5
+        self.update_steps = 3
 
-        self.a3c_model = ActorCritic(2, self.out_classes, num_hidden)
+        self.rank = rank
+        self.writer = SummaryWriter(comment='_%d'%self.rank)
+
+        self.a3c_model = ActorCritic(8, self.out_classes, num_hidden)
         self.optimizer = optim.SGD(self.a3c_model.parameters(), lr=lr)
+
+        self.MODE = MODE_NORMAL
     
     def reset(self):
         self.states = []
@@ -184,8 +233,7 @@ class DotaServiceEnv(object):
     
     @staticmethod
     def unit2input(unit):
-        loc = np.array([unit.location.x, unit.location.y]) / 7000.
-        loc = torch.from_numpy(loc).float()
+        loc = [unit.location.x / 7000., unit.location.y / 7000.]
         return loc
 
 
@@ -200,7 +248,11 @@ class DotaServiceEnv(object):
         r = []
         for unit in state.units:
             if unit.unit_type == CMsgBotWorldState.UnitType.Value('LANE_CREEP')\
-                and unit.team_id == 2:
+                or unit.unit_type == CMsgBotWorldState.UnitType.Value('TOWER')\
+                or unit.unit_type == CMsgBotWorldState.UnitType.Value('BUILDING')\
+                or unit.unit_type == CMsgBotWorldState.UnitType.Value('BARRACKS')\
+                or unit.unit_type == CMsgBotWorldState.UnitType.Value('FORT')\
+                or unit.unit_type == CMsgBotWorldState.UnitType.Value('HERO'):
                 r.append(unit)
         return r
     
@@ -215,14 +267,16 @@ class DotaServiceEnv(object):
 
         reduced_r = []
         for i in reversed(range(len(self.rewards))):
-            R = self.gamma * R + self.rewards[i]
+            R = self.gamma * R + self.rewards[i][0]
             reduced_r.append(R)
         
         reduced_r = list(reversed(reduced_r))
 
+        for i in range(len(self.rewards)):
+            reduced_r[i] += self.rewards[i][1]
+
         idxs = list(range(len(self.rewards)))
         random.shuffle(idxs)
-        idxs = idxs[:self.batch_size]
 
         #TODO: turn `for loop` to tensor operations
         for i in idxs:
@@ -239,7 +293,7 @@ class DotaServiceEnv(object):
 
             l = l - min(surr, torch.clamp(ratio, 1.0 - self.epsilon, 1.0 + self.epsilon)*adv)
         
-        l = l / self.batch_size
+        l = l / len(idxs)
         #print("train/policy_loss", l.item())
         l.backward(retain_graph=True)
         self.optimizer.step()
@@ -255,20 +309,22 @@ class DotaServiceEnv(object):
 
         reduced_r = []
         for i in reversed(range(len(self.rewards))):
-            R = self.gamma * R + self.rewards[i]
+            R = self.gamma * R + self.rewards[i][0]
             reduced_r.append(R)
         
         reduced_r = list(reversed(reduced_r))
 
+        for i in range(len(self.rewards)):
+            reduced_r[i] += self.rewards[i][1]
+
         idxs = list(range(len(self.rewards)))
         random.shuffle(idxs)
-        idxs = idxs[:self.batch_size]
 
         for i in idxs:
             adv = reduced_r[i] - self.a3c_model(self.states[i])[1]
             l = l + adv ** 2
         
-        l = l / self.batch_size
+        l = l / len(idxs)
         l.backward(retain_graph=True)
 
         #print("train/value_loss", l.item())
@@ -313,17 +369,40 @@ class DotaServiceEnv(object):
             l = self.ppo_train_actor(old_model)
         
         print("train/policy_loss", l)
+        self.writer.add_scalar("train/policy_loss", l / len(self.states))
 
-        for _ in range(self.update_steps):
-            l= self.ppo_train_critic()
+        if self.MODE == MODE_NORMAL:
+            for _ in range(self.update_steps):
+                l= self.ppo_train_critic()
         
-        print("train/value_loss", l)
+            print("train/value_loss", l)
+            self.writer.add_scalar("train/value_loss", l / len(self.states))
+
+            total_reward = np.sum(self.rewards)
         
-        print("avg reward {}".format(sum(self.rewards) / len(self.rewards)))
+            print("MODE {} total reward {} avg reward {}".format(self.MODE, total_reward, total_reward / len(self.rewards)))
+            self.writer.add_scalar("train/reward", total_reward)
+    
+    def default_action(self, state):
+        hero = state[0]
+        for unit in state:
+            if unit[4] > 0:
+                if math.hypot(hero[0]-unit[0],hero[1]-unit[1]) < 600. / 7000.:
+                    return 1
+        
+        if (hero[0] < 0 and hero[1] < 0):
+            return 5
+        else:
+            return 1
+
+        return 5
     
     async def run_a_game(self):
+        #tracker = SummaryTracker()
         #print('using model id {}'.format(id(self.a3c_model)))
         self.reset()
+        self.MODE = np.random.randint(2)
+        #print('Mode:{}'.format(self.MODE))
         # start a game
         while True:
             try:
@@ -340,22 +419,63 @@ class DotaServiceEnv(object):
             # fetch hero
             #tick_start = time()
             state = state.world_state
-            if state.dota_time > 60:
+            if state.dota_time > 130:
                 break
             prev_state = state
             # print(state.dota_time)
             hero = get_hero_unit(state)
 
-            all_units = [hero]
-            creeps = DotaServiceEnv.get_unit_list(state)
-            all_units.extend(creeps)
+            all_units = DotaServiceEnv.get_unit_list(state)
 
             input_state = []
-
-            for u in all_units:
-                input_state.append(DotaServiceEnv.unit2input(u))
             
+            hero_loc = (hero.location.x, hero.location.y)
+
+            for unit in all_units:
+                loc = [unit.location.x, unit.location.y]
+                d = math.sqrt((unit.location.x - hero_loc[0])**2 + (unit.location.y - hero_loc[1])**2)
+                
+
+                if d >= 1200:
+                    continue
+
+                if unit is not hero:
+                    loc = [hero_loc[0] - unit.location.x, hero_loc[1] - unit.location.y]
+
+                loc = [loc[0] / 7000., loc[1] / 7000.]
+
+                unit_state = list(loc)
+                type_tup = [0] * 6
+                if unit.unit_type == CMsgBotWorldState.UnitType.Value('HERO') and unit.player_id == 0:
+                    type_tup[0] = 1
+                elif unit.unit_type == CMsgBotWorldState.UnitType.Value('LANE_CREEP') and unit.team_id == hero.team_id:
+                    type_tup[1] = 1
+                elif unit.unit_type == CMsgBotWorldState.UnitType.Value('LANE_CREEP') and unit.team_id != hero.team_id:
+                    type_tup[2] = 1
+                elif unit.unit_type == CMsgBotWorldState.UnitType.Value('TOWER') and unit.team_id == hero.team_id:
+                    type_tup[3] = 1
+                elif unit.unit_type == CMsgBotWorldState.UnitType.Value('TOWER') and unit.team_id != hero.team_id:
+                    type_tup[4] = 1
+                else:
+                    type_tup[5] = 1
+                unit_state.extend(type_tup)
+
+                unit_state = np.array(unit_state)
+                unit_state = torch.from_numpy(unit_state).float()
+                if unit is hero:
+                    hero_state = unit_state
+                else:
+                    input_state.append(unit_state)
+            
+            input_state_wo_hero = sorted(input_state, key=lambda x:math.hypot(x[0],x[1]))
+            input_state = [hero_state]
+            input_state.extend(input_state_wo_hero)
+            #print(input_state)
+
+            raw_input_state = input_state
+
             input_state = torch.stack(input_state)
+            
             self.states.append(input_state)
 
             action_out, value_out = self.a3c_model(input_state)
@@ -372,8 +492,11 @@ class DotaServiceEnv(object):
             entropy = - (log_prob * prob).sum(1, keepdim=True)
             self.entropies.append(entropy)
 
-            action = prob.multinomial(num_samples=1).data
-            #action = torch.argmax(log_prob, 1).data.view(-1,1)
+            if self.MODE == MODE_NORMAL:
+                action = prob.multinomial(num_samples=1).data
+                #action = torch.argmax(log_prob, 1).data.view(-1,1)
+            elif self.MODE == MODE_AUTO:
+                action = self.default_action(raw_input_state)
             self.actions.append(action)
 
             action_pb = CMsgBotWorldState.Action()
@@ -398,13 +521,18 @@ class DotaServiceEnv(object):
                 
             except Exception as e:
                 print('Exception on env.step: {}'.format(repr(e)))
+                raise
                 break
 
-        await asyncio.get_event_loop().run_in_executor(None, self.train)
+        self.train()
+        #await asyncio.get_event_loop().run_in_executor(None, self.train)
+        #tracker.print_diff()
 
 
 def main():
-    host = 'xxx'
+    tmp_dir = '/root/Dota2BotStepByStep/runs'
+    shutil.rmtree(tmp_dir)
+    host = '172.18.5.31'
     base_port = 13337
 
     concurrent_num = 12
@@ -412,36 +540,38 @@ def main():
     eps = [
             {'host':host, 'port':i} for i in range(base_port, base_port + concurrent_num)
         ]
-    
-    host = 'xxx'
+    '''
+    host = '172.18.5.30'
 
     eps.extend([
             {'host':host, 'port':i} for i in range(base_port, base_port + concurrent_num)
         ])
+    '''
     
     thread_num = os.cpu_count()
     if thread_num > len(eps):
         thread_num = len(eps)
 
-    shared_model = ActorCritic(2, 9, num_hidden)
+    shared_model = ActorCritic(8, 9, num_hidden)
     shared_model.share_memory()
-    threads = [mp.Process(target=worker_thread,args=(eps[i::thread_num],shared_model)) for i in range(thread_num)]
+    threads = [mp.Process(target=worker_thread,args=(i, eps[i::thread_num],shared_model)) for i in range(thread_num)]
     for t in threads:
         t.start()
     
     for t in threads:
         t.join()
 
-def worker_thread(eps, shared_model):
+def worker_thread(rank, eps, shared_model):
     loop=asyncio.get_event_loop()
     actors = [
-            DotaServiceEnv(config=config,
+            DotaServiceEnv(rank=rank,config=config,
                 **ep) for ep in eps
         ]
     print('thread start {} actors end points {}'.format(len(actors), eps))
     for a in actors:
         a.set_model(shared_model)
     
+    np.random.seed()
     loop.run_until_complete(working_loop(actors))
 
 async def working_loop(actors):

@@ -297,7 +297,7 @@ if __name__ == '__main__':
     for name, param in model.named_parameters(): 
         weight_init.normal(param); 
     model.share_memory()
-    test(model)
+    #test(model)
 
-    #parallel.start_parallel(ParallelA3CPPOEnv, model, np=os.cpu_count(), func=test_without_gui, args=None)
+    parallel.start_parallel(ParallelA3CPPOEnv, model, np=os.cpu_count(), func=test_without_gui, args=None)
 
